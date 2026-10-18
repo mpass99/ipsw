@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/MakeNowJust/heredoc/v2"
@@ -54,6 +55,8 @@ func init() {
 	kernelSymbolicateCmd.Flags().Bool("schema", false, "Generate JSON schema")
 	kernelSymbolicateCmd.Flags().MarkHidden("schema")
 	kernelSymbolicateCmd.Flags().StringP("signatures", "s", "", "Path to signatures folder")
+	kernelSymbolicateCmd.Flags().StringP("bindiff", "b", "", "Symbolicate with BinDiff: directory laid out like a KDK, with a BinDiff database (KDK Mach-O vs. kernelcache entry) next to each Mach-O")
+	kernelSymbolicateCmd.Flags().Bool("aliases", false, "With --bindiff --json: write all names of an address as a list, primary name first (for 'ipsw kernel extract --symbols')")
 	kernelSymbolicateCmd.Flags().Uint64P("lookup", "l", 0, "Lookup the nearest symbol for an address (input may be a kernelcache or a symbols JSON map)")
 	kernelSymbolicateCmd.Flags().StringP("output", "o", "", "Folder to write files to")
 	kernelSymbolicateCmd.Flags().StringP("arch", "a", "", "Which architecture to use for fat/universal MachO")
@@ -64,6 +67,8 @@ func init() {
 	viper.BindPFlag("kernel.symbolicate.test", kernelSymbolicateCmd.Flags().Lookup("test"))
 	viper.BindPFlag("kernel.symbolicate.schema", kernelSymbolicateCmd.Flags().Lookup("schema"))
 	viper.BindPFlag("kernel.symbolicate.signatures", kernelSymbolicateCmd.Flags().Lookup("signatures"))
+	viper.BindPFlag("kernel.symbolicate.bindiff", kernelSymbolicateCmd.Flags().Lookup("bindiff"))
+	viper.BindPFlag("kernel.symbolicate.aliases", kernelSymbolicateCmd.Flags().Lookup("aliases"))
 	viper.BindPFlag("kernel.symbolicate.lookup", kernelSymbolicateCmd.Flags().Lookup("lookup"))
 	viper.BindPFlag("kernel.symbolicate.output", kernelSymbolicateCmd.Flags().Lookup("output"))
 	viper.BindPFlag("kernel.symbolicate.arch", kernelSymbolicateCmd.Flags().Lookup("arch"))
@@ -81,7 +86,9 @@ var kernelSymbolicateCmd = &cobra.Command{
 		# Look up the nearest symbol for an address directly from a kernelcache
 		❯ ipsw kernel symbolicate --signatures /path/to/sigs --lookup 0xfffffe000aecb258 kernelcache.release.iPhone18,1
 		# Look up the nearest symbol using a previously generated symbol map
-		❯ ipsw kernel symbolicate --lookup 0xfffffe000aecb258 kernelcache.release.iPhone18,1.symbols.json`),
+		❯ ipsw kernel symbolicate --lookup 0xfffffe000aecb258 kernelcache.release.iPhone18,1.symbols.json
+		# Symbolicate a kernelcache with BinDiff databases against a KDK and write the map to JSON
+		❯ ipsw kernel symbolicate --bindiff /path/to/kdk-with-bindiffs --json kernelcache.release.iPhone18,1`),
 	Args:          cobra.ExactArgs(1),
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) (err error) {
@@ -133,7 +140,16 @@ var kernelSymbolicateCmd = &cobra.Command{
 			}
 		}
 
-		smap, err := buildSymbolMapFromKernelcache(args[0], selectedArch, sigDir, quiet)
+		var smap signature.SymbolMap
+		var aliases signature.SymbolAliases
+		if bindiff := viper.GetString("kernel.symbolicate.bindiff"); bindiff != "" {
+			if sigDir != "" {
+				return fmt.Errorf("--bindiff and --signatures cannot be combined")
+			}
+			smap, aliases, err = buildSymbolMapFromBinDiff(args[0], selectedArch, bindiff, quiet)
+		} else {
+			smap, err = buildSymbolMapFromKernelcache(args[0], selectedArch, sigDir, quiet)
+		}
 		if err != nil {
 			return err
 		}
@@ -174,7 +190,11 @@ var kernelSymbolicateCmd = &cobra.Command{
 		/* JSON OUTPUT */
 
 		if viper.GetBool("kernel.symbolicate.json") {
-			jdat, err := json.Marshal(smap)
+			var out any = smap
+			if viper.GetBool("kernel.symbolicate.aliases") {
+				out = withAliases(smap, aliases)
+			}
+			jdat, err := json.Marshal(out)
 			if err != nil {
 				return fmt.Errorf("failed to marshal symbol map: %v", err)
 			}
@@ -247,6 +267,35 @@ func buildSymbolMapFromKernelcache(path, arch, sigDir string, quiet bool) (signa
 		return nil, fmt.Errorf("failed to symbolicate kernelcache: %v", err)
 	}
 	return smap, nil
+}
+
+func buildSymbolMapFromBinDiff(path, arch, kdkPath string, quiet bool) (signature.SymbolMap, signature.SymbolAliases, error) {
+	m, err := mcmd.OpenMachO(path, arch)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to open kernelcache: %v", err)
+	}
+	defer m.Close()
+
+	smap := signature.NewSymbolMap()
+	log.WithField("kernelcache", filepath.Base(path)).Info("Symbolicating with BinDiff...")
+	aliases, err := smap.SymbolicateMachOWithBinDiff(m.File, kdkPath, quiet)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to symbolicate kernelcache: %v", err)
+	}
+	return smap, aliases, nil
+}
+
+// withAliases maps every address with further names to a list, primary name first.
+func withAliases(smap signature.SymbolMap, aliases signature.SymbolAliases) map[string]any {
+	out := make(map[string]any, len(smap))
+	for addr, name := range smap {
+		if extra := aliases[addr]; len(extra) > 0 {
+			out[strconv.FormatUint(addr, 10)] = append([]string{name}, extra...)
+		} else {
+			out[strconv.FormatUint(addr, 10)] = name
+		}
+	}
+	return out
 }
 
 var kernelSymbolSuffixRE = regexp.MustCompile(`\.\d+$`)
